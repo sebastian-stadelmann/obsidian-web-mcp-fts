@@ -254,8 +254,10 @@ All of the server's own variables apply (`VAULT_PATH`, `VAULT_MCP_TOKEN`, OAuth 
 
 ## Container
 
-An example, not yet built and tested by the author. `uv sync` fetches the pinned server
-from GitHub, so the image needs `git`.
+This is the image the author runs, built and started with rootless Podman. `uv sync`
+fetches the pinned server from GitHub, so the image needs `git`. `--frozen` installs
+exactly the locked versions; a separate pin on `mcp`, as some older setups of the stock
+server carry, is not needed.
 
 ```dockerfile
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
