@@ -4,6 +4,15 @@ One row per note. The searchable text is split into columns so a hit in the titl
 aliases or description can outrank a hit somewhere in the body (bm25 column weights).
 The index is derived data: it can be deleted at any time and is rebuilt from disk.
 
+Stemming is done at query time, not in the index. The notes are indexed word for word;
+a side table maps every word of the index vocabulary to its stem per language, and a
+query word is expanded to the vocabulary words sharing its stem ("zertifikat" ->
+"zertifikat" OR "zertifikate"). Because the text itself is never stemmed, exact
+phrases, FTS5 syntax, snippets, highlights and the column weights keep working as they
+are, several languages can be active at once, and changing the languages rebuilds only
+the side table. The price is BM25 seeing each form as its own term, so a rare form
+counts a little more than a common one.
+
 Every path that reaches the index goes through ``resolve_vault_read_path``, the same
 guard the server's read tools use, so dotfiles, paths escaping the vault and
 hardlinked files are never indexed and never returned.
@@ -17,22 +26,23 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+import unicodedata
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 import frontmatter
 from obsidian_vault_mcp import config as vault_config
 from obsidian_vault_mcp.vault import resolve_vault_read_path
 
-from .stopwords import STOPWORDS
+from .languages import Language
 
 logger = logging.getLogger(__name__)
 
 # Bump when the table layout, the column order or the tokenizer changes. A database
 # with a different version is dropped and rebuilt on open.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Column order is part of the schema: bm25() weights and the column numbers passed to
 # snippet()/highlight() are positional.
@@ -53,6 +63,12 @@ _BM25_ARGS = ", ".join(str(WEIGHTS[name]) for name in COLUMNS)
 TOKENIZER = "unicode61 remove_diacritics 2"
 
 SNIPPET_TOKENS = 24
+# Upper bound on the word forms one query word is expanded to (closest in length first).
+MAX_WORD_FORMS = 32
+# A note that has query words only in another form loses up to this share of its score.
+FORM_ONLY_PENALTY = 0.5
+# How many hits beyond max_results are ranked before the penalty reorders and cuts them.
+RERANK_WINDOW = 30
 # Control characters as internal match markers: they cannot occur in note text the way
 # any printable marker could, so "did this column match" is an exact test.
 _MARK_OPEN, _MARK_CLOSE = "\x02", "\x03"
@@ -148,7 +164,16 @@ def db_path_inside_vault(db_path: str | Path) -> bool:
     return resolved == vault_root or vault_root in resolved.parents
 
 
-def literal_terms(query: str) -> list[str]:
+@dataclass(frozen=True, slots=True)
+class Term:
+    """One search term of a plain-word query."""
+
+    text: str  # as the caller typed it, for display: 'file provider', 'änder*'
+    match: str  # the FTS5 expression searched: '"file provider"', '"änder" *'
+    word: str | None  # the bare word if this is a single word without *, else None
+
+
+def literal_terms(query: str) -> list[Term]:
     """Turn free text into safely quoted FTS5 terms.
 
     Each whitespace-separated chunk becomes one quoted phrase of its word characters,
@@ -156,28 +181,30 @@ def literal_terms(query: str) -> list[str]:
     indexed it) instead of failing in the FTS5 parser. A trailing * is kept as a
     prefix operator.
     """
-    terms = []
+    terms: list[Term] = []
     for chunk in query.split():
         words = _WORD_RE.findall(chunk)
         if not words:
             continue
-        term = '"' + " ".join(words) + '"'
-        if chunk.endswith("*"):
-            term += " *"
-        if term not in terms:
-            terms.append(term)
+        prefix = chunk.endswith("*")
+        match = '"' + " ".join(words) + '"' + (" *" if prefix else "")
+        if all(term.match != match for term in terms):
+            text = " ".join(words) + ("*" if prefix else "")
+            terms.append(Term(text, match, words[0] if len(words) == 1 and not prefix else None))
     return terms
 
 
-def _is_stopword(term: str) -> bool:
-    """True for a single filler word. A phrase or a prefix term is never a stopword."""
-    return not term.endswith(" *") and term.strip('"').lower() in STOPWORDS
+def fold(word: str) -> str:
+    """Lower-case and strip diacritics the way the index tokenizer does ("Müller" ->
+    "muller"), so a query word can be looked up in the index vocabulary. An exotic
+    character folded differently only means that word is not expanded."""
+    decomposed = unicodedata.normalize("NFKD", word.lower())
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
-def _unquote(term: str) -> str:
-    """'"file provider"' -> 'file provider', '"änder" *' -> 'änder*' (for display)."""
-    prefix = term.endswith(" *")
-    return term.removesuffix(" *").strip('"') + ("*" if prefix else "")
+def _stemmable(word: str) -> bool:
+    """Plain words only: "e2ee", "k8s" or "v3" have no word forms."""
+    return len(word) > 2 and word.isalpha()
 
 
 class FtsIndex:
@@ -188,9 +215,19 @@ class FtsIndex:
     two updates of one file cannot interleave and leave the older content behind.
     """
 
-    def __init__(self, db_path: str | Path, max_file_bytes: int = 2_000_000) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        max_file_bytes: int = 2_000_000,
+        languages: Sequence[Language] = (),
+    ) -> None:
         self._db_path: str | Path = db_path if str(db_path) == ":memory:" else Path(db_path).expanduser()
         self._max_file_bytes = max_file_bytes
+        self._languages = tuple(languages)
+        self._stopwords = frozenset().union(*(lang.stopwords for lang in self._languages))
+        # Set by every index write; the stem table is brought up to date lazily, before
+        # the next search, so a burst of writes costs one vocabulary scan, not many.
+        self._stems_dirty = True
         self._lock = threading.RLock()
         self._con: sqlite3.Connection | None = None
 
@@ -262,12 +299,12 @@ class FtsIndex:
         con = self._con
         version = con.execute("PRAGMA user_version").fetchone()[0]
         has_tables = con.execute(
-            "SELECT count(*) FROM sqlite_master WHERE name IN ('docs', 'notes')"
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('docs', 'notes', 'word_stems')"
         ).fetchone()[0]
         if has_tables and version != SCHEMA_VERSION:
             logger.info("FTS schema version %s != %s; rebuilding index", version, SCHEMA_VERSION)
-            con.execute("DROP TABLE IF EXISTS notes")
-            con.execute("DROP TABLE IF EXISTS docs")
+            for table in ("notes_vocab", "notes", "docs", "word_stems"):
+                con.execute(f"DROP TABLE IF EXISTS {table}")
         con.execute(
             "CREATE TABLE IF NOT EXISTS docs ("
             " id INTEGER PRIMARY KEY,"
@@ -278,6 +315,21 @@ class FtsIndex:
         con.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS notes USING fts5({', '.join(COLUMNS)}, tokenize=\"{TOKENIZER}\")"
         )
+        # The index vocabulary (already lower-cased and diacritics-folded) ...
+        con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS notes_vocab USING fts5vocab(notes, 'row')")
+        # ... and the stem of each of its words, per language.
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS word_stems ("
+            " word TEXT NOT NULL, lang TEXT NOT NULL, stem TEXT NOT NULL,"
+            " PRIMARY KEY (word, lang)) WITHOUT ROWID"
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS word_stems_by_stem ON word_stems (lang, stem)")
+        # A language that was switched off must stop contributing word forms.
+        active = [lang.name for lang in self._languages]
+        con.execute(
+            f"DELETE FROM word_stems WHERE lang NOT IN ({', '.join('?' * len(active))})", active
+        )
+        self._stems_dirty = True
         con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _require_open(self) -> sqlite3.Connection:
@@ -332,6 +384,11 @@ class FtsIndex:
             # Rows dropped inside the loop (file vanished mid-walk) are counted too.
             stats["removed"] += len(stale)
             stats["total"] = con.execute("SELECT count(*) FROM docs").fetchone()[0]
+            # Words that left the vocabulary would only ever expand to nothing; drop
+            # them here so the table does not grow forever.
+            con.execute("DELETE FROM word_stems WHERE word NOT IN (SELECT term FROM notes_vocab)")
+            self._refresh_stems_locked()
+            stats["stemmed_words"] = con.execute("SELECT count(DISTINCT word) FROM word_stems").fetchone()[0]
         stats["seconds"] = round(time.monotonic() - started, 3)
         return stats
 
@@ -378,6 +435,7 @@ class FtsIndex:
         row = con.execute("SELECT id FROM docs WHERE path = ?", (rel_path,)).fetchone()
         if row is None:
             return
+        self._stems_dirty = True
         con.execute("DELETE FROM notes WHERE rowid = ?", (row[0],))
         con.execute("DELETE FROM docs WHERE id = ?", (row[0],))
 
@@ -412,6 +470,7 @@ class FtsIndex:
             self._delete_locked(rel_path)
             return "skipped"
         note = parse_note(rel_path, text)
+        self._stems_dirty = True
         values = (rel_path, note.title, note.aliases, note.description, note.tags, note.headings, note.body)
 
         if row:
@@ -429,6 +488,54 @@ class FtsIndex:
         )
         return "indexed"
 
+    # -- stemming --
+
+    def _refresh_stems_locked(self) -> None:
+        """Stem the vocabulary words that have no stem yet, for every active language."""
+        if not self._stems_dirty:
+            return
+        with self._transaction() as con:
+            for lang in self._languages:
+                new_words = [
+                    row[0]
+                    for row in con.execute(
+                        "SELECT term FROM notes_vocab"
+                        " WHERE term NOT IN (SELECT word FROM word_stems WHERE lang = ?)",
+                        (lang.name,),
+                    ).fetchall()
+                ]
+                con.executemany(
+                    "INSERT OR REPLACE INTO word_stems (word, lang, stem) VALUES (?, ?, ?)",
+                    ((word, lang.name, lang.stem(word) if _stemmable(word) else word) for word in new_words),
+                )
+        self._stems_dirty = False
+
+    def _word_forms(self, word: str) -> list[str]:
+        """Other words of the index vocabulary that share a stem with *word*, in any
+        active language. Closest in length first, since those are the likeliest
+        inflections and the rest is cut off at MAX_WORD_FORMS."""
+        folded = fold(word)
+        if not _stemmable(folded):
+            return []
+        forms: set[str] = set()
+        for lang in self._languages:
+            rows = self._con.execute(
+                "SELECT word FROM word_stems WHERE lang = ? AND stem = ?", (lang.name, lang.stem(folded))
+            )
+            forms.update(row[0] for row in rows)
+        forms.discard(folded)
+        return sorted(forms, key=lambda form: (abs(len(form) - len(folded)), form))[:MAX_WORD_FORMS]
+
+    def _expand(self, term: Term, word_forms: dict[str, list[str]]) -> Term:
+        """A single word also matches its other word forms; phrases and prefixes stay exact."""
+        if term.word is None or not self._languages:
+            return term
+        forms = self._word_forms(term.word)
+        if not forms:
+            return term
+        word_forms[term.text] = forms
+        return replace(term, match="(" + " OR ".join(f'"{form}"' for form in (fold(term.word), *forms)) + ")")
+
     # -- reading --
 
     def search(self, query: str, path_prefix: str | None = None, max_results: int = 20) -> dict:
@@ -438,7 +545,11 @@ class FtsIndex:
           fts5     the query used FTS5 syntax and ran as written
           all      plain words, every term occurs in each returned note
           relaxed  plain words, no note had every term; "dropped_terms" were left out
-        Plain-word queries ignore filler words; "ignored_stopwords" lists them.
+        Plain-word queries ignore the filler words of the active languages
+        ("ignored_stopwords") and also match other forms of each word ("word_forms" maps
+        a query word to the forms it was expanded to). A hit that has some query word
+        only in another form carries "match": "word_forms" and a reduced score. An FTS5
+        query gets neither.
         """
         query = query.strip()
         prefix = _normalize_prefix(path_prefix)
@@ -448,7 +559,8 @@ class FtsIndex:
 
             if _ADVANCED_RE.search(query):
                 try:
-                    return self._run(query, prefix, max_results, "fts5")
+                    results, truncated = self._run(query, prefix, max_results)
+                    return _payload(results, truncated, "fts5")
                 except sqlite3.OperationalError:
                     # "10:30", "C++", a URL, an unbalanced quote: not meant as syntax.
                     pass
@@ -458,30 +570,73 @@ class FtsIndex:
                 return {"error": "Query contains no searchable terms", "results": [], "total": 0, "truncated": False}
             # Filler words would act as hard filters (see stopwords.py). A query made
             # of nothing else ("was ist das") is searched as it stands.
-            content_terms = [term for term in terms if not _is_stopword(term)]
-            ignored = [_unquote(term) for term in terms if _is_stopword(term)] if content_terms else []
+            content_terms = [term for term in terms if not self._is_stopword(term)]
+            ignored = [term.text for term in terms if self._is_stopword(term)] if content_terms else []
             terms = content_terms or terms
 
-            payload = self._run(" ".join(terms), prefix, max_results, "all")
+            self._refresh_stems_locked()
+            word_forms: dict[str, list[str]] = {}
+            expanded = [self._expand(term, word_forms) for term in terms]
+
+            payload = self._ranked(terms, expanded, prefix, max_results, "all")
             if payload["total"] == 0 and len(terms) > 1:
-                payload = self._relax(terms, prefix, max_results) or payload
+                payload = self._relax(terms, expanded, prefix, max_results) or payload
             if ignored:
                 payload["ignored_stopwords"] = ignored
+            used_forms = {text: forms for text, forms in word_forms.items() if text not in payload.get("dropped_terms", ())}
+            if used_forms:
+                payload["word_forms"] = used_forms
             return payload
 
-    def _relax(self, terms: list[str], prefix: str | None, max_results: int) -> dict | None:
+    def _ranked(
+        self, terms: list[Term], expanded: list[Term], prefix: str | None, max_results: int, mode: str
+    ) -> dict:
+        """Search all word forms, but let the words as typed count for more.
+
+        BM25 treats every form as a term of its own, so a rare form outweighs the common
+        one: for "entscheidung" a note containing only "entscheidend" and "Entscheiderin"
+        came out on top of every note that had the word itself. A note therefore loses
+        up to FORM_ONLY_PENALTY of its score, in proportion to how many of the query
+        words it has only in another form. Strict tiers (all exact matches first) were
+        tried too and rejected: for "livesync bridge permission" they put a hub page
+        that happens to say "permission" above the howto that says "permissions" and is
+        about all three words.
+        """
+        stemmed = [i for i, (term, wide) in enumerate(zip(terms, expanded, strict=True)) if term.match != wide.match]
+        if not stemmed:
+            results, truncated = self._run(_all_of(terms), prefix, max_results)
+            return _payload(results, truncated, mode)
+
+        # The penalty reorders, so rank a window larger than what is returned.
+        window, _ = self._run(_all_of(expanded), prefix, max_results + RERANK_WINDOW)
+        typed = {i: set(self._paths(terms[i].match, prefix)) for i in stemmed}
+        for hit in window:
+            form_only = sum(hit["path"] not in typed[i] for i in stemmed)
+            if form_only:
+                hit["score"] = round(hit["score"] * (1 - FORM_ONLY_PENALTY * form_only / len(terms)), 3)
+                hit["match"] = "word_forms"
+        window.sort(key=lambda hit: -hit["score"])
+        return _payload(window[:max_results], len(window) > max_results, mode)
+
+    def _is_stopword(self, term: Term) -> bool:
+        """A single filler word of an active language. Phrases and prefixes never are."""
+        return term.word is not None and term.word.lower() in self._stopwords
+
+    def _relax(
+        self, terms: list[Term], expanded: list[Term], prefix: str | None, max_results: int
+    ) -> dict | None:
         """No note has every term: search the largest set of terms that some note has.
 
-        One lookup per term gives the notes containing it; counting terms per note
-        finds the best coverage exactly, without guessing which term to give up. When
-        several term sets tie, the one with the rarest terms wins (it is the most
-        specific reading of the query), then the one earliest in the query.
+        One lookup per term gives the notes containing it (in any word form); counting
+        terms per note finds the best coverage exactly, without guessing which term to
+        give up. When several term sets tie, the one with the rarest terms wins (it is
+        the most specific reading of the query), then the one earliest in the query.
         """
-        notes_with = {term: self._rowids(term, prefix) for term in terms}
-        terms_in: dict[int, set[str]] = {}
-        for term, rowids in notes_with.items():
+        notes_with = [self._rowids(term.match, prefix) for term in expanded]
+        terms_in: dict[int, set[int]] = {}
+        for position, rowids in enumerate(notes_with):
             for rowid in rowids:
-                terms_in.setdefault(rowid, set()).add(term)
+                terms_in.setdefault(rowid, set()).add(position)
         if not terms_in:
             return None
 
@@ -489,15 +644,25 @@ class FtsIndex:
         candidates = {frozenset(found) for found in terms_in.values() if len(found) == best}
         chosen = min(
             candidates,
-            key=lambda subset: (
-                sum(len(notes_with[term]) for term in subset),
-                sorted(terms.index(term) for term in subset),
-            ),
+            key=lambda subset: (sum(len(notes_with[position]) for position in subset), sorted(subset)),
         )
-        kept = [term for term in terms if term in chosen]
-        payload = self._run(" ".join(kept), prefix, max_results, "relaxed")
-        payload["dropped_terms"] = [_unquote(term) for term in terms if term not in chosen]
+        payload = self._ranked(
+            [terms[position] for position in sorted(chosen)],
+            [expanded[position] for position in sorted(chosen)],
+            prefix,
+            max_results,
+            "relaxed",
+        )
+        payload["dropped_terms"] = [term.text for position, term in enumerate(terms) if position not in chosen]
         return payload
+
+    def _paths(self, match: str, prefix: str | None) -> list[str]:
+        sql = "SELECT docs.path FROM notes JOIN docs ON docs.id = notes.rowid WHERE notes MATCH ?"
+        params: list = [match]
+        if prefix:
+            sql += " AND substr(docs.path, 1, ?) = ?"
+            params += [len(prefix), prefix]
+        return [row[0] for row in self._con.execute(sql, params)]
 
     def _rowids(self, match: str, prefix: str | None) -> list[int]:
         sql = "SELECT notes.rowid FROM notes JOIN docs ON docs.id = notes.rowid WHERE notes MATCH ?"
@@ -507,7 +672,8 @@ class FtsIndex:
             params += [len(prefix), prefix]
         return [row[0] for row in self._con.execute(sql, params)]
 
-    def _run(self, match: str, prefix: str | None, max_results: int, mode: str) -> dict:
+    def _run(self, match: str, prefix: str | None, max_results: int) -> tuple[list[dict], bool]:
+        """Run one FTS5 query. Returns the ranked hits and whether there were more."""
         con = self._con
         field_marks = ", ".join(
             f"highlight(notes, {i}, char(2), char(3))" for i in range(len(COLUMNS)) if i != _BODY_COL
@@ -561,7 +727,16 @@ class FtsIndex:
                 entry["tags"] = tags.split("\n")
             results.append(entry)
 
-        return {"results": results, "total": len(results), "truncated": truncated, "query_mode": mode}
+        return results, truncated
+
+
+def _payload(results: list[dict], truncated: bool, mode: str) -> dict:
+    return {"results": results, "total": len(results), "truncated": truncated, "query_mode": mode}
+
+
+def _all_of(terms: list[Term]) -> str:
+    """Every term must match. Explicit AND: FTS5 rejects an implicit one between groups."""
+    return " AND ".join(term.match for term in terms)
 
 
 def _clean_snippet(text: str | None) -> str:

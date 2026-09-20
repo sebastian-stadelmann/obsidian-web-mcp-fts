@@ -105,8 +105,8 @@ def test_relaxes_to_the_largest_term_set_some_note_has(index):
 def test_filler_words_do_not_filter(index):
     payload = index.search("Warum läuft bei Traefik kein Zertifikat aus?")
     assert payload["ignored_stopwords"] == ["Warum", "bei", "kein", "aus"]
-    # "läuft" and "Zertifikat" occur nowhere (no stemming yet: the notes say "laufen", "Zertifikate").
-    assert payload["dropped_terms"] == ["läuft", "Zertifikat"]
+    # "läuft" has no form in the vault (the notes say "laufen": irregular, out of a stemmer's reach).
+    assert payload["dropped_terms"] == ["läuft"]
     assert set(paths(payload)) == {"howto/livesync-traefik.md", "daily/2026-09-01.md"}
 
     # The words are still in the index: a phrase or any FTS5 query matches them exactly.
@@ -138,5 +138,8 @@ def test_query_without_words_is_an_error_not_a_crash(index):
 
 
 def test_literal_terms():
-    assert literal_terms("file-provider  C++ vault_mcp") == ['"file provider"', '"C"', '"vault_mcp"']
-    assert literal_terms("änder* --- änder*") == ['"änder" *']
+    terms = literal_terms("file-provider  C++ vault_mcp")
+    assert [term.match for term in terms] == ['"file provider"', '"C"', '"vault_mcp"']
+    assert [term.word for term in terms] == [None, "C", "vault_mcp"]  # a phrase has no single word
+    (prefix,) = literal_terms("änder* --- änder*")
+    assert (prefix.text, prefix.match, prefix.word) == ("änder*", '"änder" *', None)

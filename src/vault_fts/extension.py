@@ -13,24 +13,37 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import config
 from .index import FtsIndex, db_path_inside_vault
+from .languages import resolve_languages
 
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "vault_fts_search"
-TOOL_DESCRIPTION = (
-    "Ranked full-text search over the vault's markdown notes (SQLite FTS5, BM25). "
-    "Matches whole notes, not lines: every term must occur somewhere in the note "
-    "(path, title, aliases, description, tags, headings or body). German and English "
-    "filler words (wie, warum, mit, the, how ...) are ignored. If no note has every term, "
-    "the largest set of terms that some note has is searched instead (query_mode is then "
-    "'relaxed' and dropped_terms lists what was left out). Hits in "
-    "title, aliases and description rank above hits in the body. Case- and "
-    "diacritics-insensitive (muller finds Müller). No stemming: add * for a prefix "
-    "match (änderung* also finds Änderungen). FTS5 syntax works: \"exact phrase\", "
-    "term*, a OR b, a NOT b, NEAR(a b, 5), title:term. Returns path, title, score, "
-    "matched_fields and a snippet with «matches» marked. Prefer this over vault_search "
-    "for topic and keyword lookups; use vault_search for regex or exact line matches."
-)
+
+
+def tool_description(languages: tuple[str, ...]) -> str:
+    """What the model reads to decide when and how to call the tool."""
+    if languages:
+        language_notes = (
+            f"Active languages: {', '.join(languages)}. Their filler words (the, how, wie, warum ...) "
+            "are ignored, and a word also matches its other word forms through stemming "
+            "(certificate finds certificates, Entscheidung finds Entscheidungen); word_forms "
+            "shows the expansion. Put a word in double quotes to match it exactly. "
+        )
+    else:
+        language_notes = "No stemming: add * for a prefix match (änderung* also finds Änderungen). "
+    return (
+        "Ranked full-text search over the vault's markdown notes (SQLite FTS5, BM25). "
+        "Matches whole notes, not lines: every term must occur somewhere in the note "
+        "(path, title, aliases, description, tags, headings or body). If no note has every "
+        "term, the largest set of terms that some note has is searched instead (query_mode "
+        "is then 'relaxed' and dropped_terms lists what was left out). Hits in title, aliases "
+        "and description rank above hits in the body. Case- and diacritics-insensitive "
+        "(muller finds Müller). " + language_notes + "FTS5 syntax works and runs as written: "
+        "\"exact phrase\", term*, a OR b, a NOT b, NEAR(a b, 5), title:term. Returns path, "
+        "title, score, matched_fields and a snippet with «matches» marked. Prefer this over "
+        "vault_search for topic and keyword lookups; use vault_search for regex or exact "
+        "line matches."
+    )
 
 
 class VaultFtsSearchInput(BaseModel):
@@ -57,11 +70,23 @@ class FtsExtension(Extension):
     vault_write already sees the new text.
     """
 
-    def __init__(self, db_path: str | Path | None = None, max_file_bytes: int | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        max_file_bytes: int | None = None,
+        languages: str | None = None,
+    ) -> None:
         self._db_path = db_path if db_path is not None else config.VAULT_FTS_DB_PATH
+        try:
+            self._languages = resolve_languages(languages if languages is not None else config.VAULT_FTS_LANGUAGES)
+        except ValueError as exc:
+            # A typo must not silently switch a language off. Runs before serve() has
+            # set up logging, so the message goes out through SystemExit itself.
+            raise SystemExit(f"VAULT_FTS_LANGUAGES: {exc}") from exc
         self._index = FtsIndex(
             self._db_path,
             max_file_bytes=max_file_bytes if max_file_bytes is not None else config.VAULT_FTS_MAX_FILE_BYTES,
+            languages=self._languages,
         )
         self._unavailable_reason = "FTS index has not been started"
 
@@ -74,7 +99,7 @@ class FtsExtension(Extension):
     def register_tools(self, mcp) -> None:
         @mcp.tool(
             name=TOOL_NAME,
-            description=TOOL_DESCRIPTION,
+            description=tool_description(tuple(lang.name for lang in self._languages)),
             annotations={
                 "readOnlyHint": True,
                 "destructiveHint": False,
@@ -120,8 +145,10 @@ class FtsExtension(Extension):
             self._index.close()
             return
         logger.info(
-            "FTS index ready: %d notes (%d indexed, %d unchanged, %d removed, %d skipped) in %.2fs [%s]",
+            "FTS index ready: %d notes (%d indexed, %d unchanged, %d removed, %d skipped), "
+            "%d words stemmed for [%s] in %.2fs [%s]",
             stats["total"], stats["indexed"], stats["unchanged"], stats["removed"], stats["skipped"],
+            stats["stemmed_words"], ", ".join(lang.name for lang in self._languages) or "no language",
             stats["seconds"], self._db_path,
         )
 

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from ._samples import DAILY, FILLER, HOWTO, PERSON, PROJECT
+from ._samples import DAILY, ENGLISH, FILLER, HOWTO, PERSON, PROJECT, SINGULAR
 
 
 @pytest.fixture
@@ -15,6 +15,8 @@ def vault(tmp_path, monkeypatch):
         "people/Müller.md": PERSON,
         "daily/2026-09-01.md": DAILY,
         "projekte/website.md": PROJECT,
+        "notes/renewal.md": ENGLISH,
+        "notizen/zertifikat.md": SINGULAR,
         ".obsidian/config.json": '{"theme": "dark"}',
         ".trash/old.md": "Traefik im Papierkorb\n",
         "notes.txt": "Traefik in einer Textdatei\n",
@@ -39,8 +41,10 @@ def vault(tmp_path, monkeypatch):
 @pytest.fixture
 def index(vault, tmp_path):
     from vault_fts.index import FtsIndex
+    from vault_fts.languages import resolve_languages
 
-    idx = FtsIndex(tmp_path / "state" / "fts.sqlite")
+    # The sample vault is German with English terms, like the vault this was built for.
+    idx = FtsIndex(tmp_path / "state" / "fts.sqlite", languages=resolve_languages("en,de"))
     idx.open()
     idx.reconcile()
     yield idx

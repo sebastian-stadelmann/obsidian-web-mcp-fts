@@ -36,6 +36,10 @@ Mit Müller über Traefik gesprochen. Zertifikate laufen aus.
 
 PROJECT = "Website Relaunch: neues Theme, Umzug auf den neuen Server.\n"
 
+ENGLISH = "Renewing the wildcard: it expires yearly, so the job retries nightly.\n"
+
+SINGULAR = "Ein Zertifikat von Let's Encrypt.\n"
+
 # Filler so the corpus is large enough for BM25: with four notes a term that occurs in
 # two of them has an inverse document frequency of zero and every score collapses to 0.
 FILLER = {
@@ -45,7 +49,7 @@ FILLER = {
     )
 }
 
-NAMED_NOTES = 4
+NAMED_NOTES = 6
 NOTE_COUNT = NAMED_NOTES + len(FILLER)
 
 

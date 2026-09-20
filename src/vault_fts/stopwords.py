@@ -1,4 +1,4 @@
-"""Function words ignored in plain-word queries.
+"""Function words ignored in plain-word queries, per language.
 
 Every term of a plain query must occur in a note, so a filler word acts as a hard
 filter: "wie richte ich shorewall mit fail2ban ein" would only find notes that also
@@ -8,6 +8,9 @@ still matches them exactly.
 
 Deliberately short and limited to words that carry no topic. Left out on purpose:
 "it" (IT as in IT-Sicherheit), "weg", "machen", "viel", "weiter".
+
+Keyed by Snowball algorithm name, like everything language-specific (see languages.py).
+A language without an entry here is stemmed but has no stopwords.
 """
 
 GERMAN = frozenset("""
@@ -29,4 +32,4 @@ is its my not of on or our should than that the their then there these they this
 to was we were what when where which who why with would you your
 """.split())
 
-STOPWORDS = GERMAN | ENGLISH
+STOPWORDS_BY_LANGUAGE = {"english": ENGLISH, "german": GERMAN}

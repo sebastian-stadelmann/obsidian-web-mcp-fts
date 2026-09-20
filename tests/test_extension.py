@@ -28,7 +28,7 @@ class RecordingFrontmatterIndex:
 @pytest.fixture
 def started(vault, tmp_path):
     """An extension taken through the hooks in the order serve() calls them."""
-    ext = FtsExtension(db_path=tmp_path / "state" / "fts.sqlite")
+    ext = FtsExtension(db_path=tmp_path / "state" / "fts.sqlite", languages="en,de")
     mcp = FastMCP("test")
     frontmatter_index = RecordingFrontmatterIndex()
     ext.register_tools(mcp)
@@ -56,6 +56,8 @@ def test_tool_is_registered_and_searches(started):
     assert TOOL_NAME in tools
     assert tools[TOOL_NAME].annotations.readOnlyHint is True
     assert set(tools[TOOL_NAME].inputSchema["properties"]) == {"query", "path_prefix", "max_results"}
+
+    assert "Active languages: english, german" in tools[TOOL_NAME].description
 
     assert ext.index.doc_count == NOTE_COUNT
     payload = call_tool(mcp, {"query": "traefik file-provider", "path_prefix": "howto/"})

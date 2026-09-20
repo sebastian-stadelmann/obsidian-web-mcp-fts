@@ -47,6 +47,7 @@ def live_server(tmp_path, vault, db_path):
         "VAULT_MCP_PATH": "/",
         "VAULT_MCP_PUBLIC_URL": f"http://127.0.0.1:{port}",
         "VAULT_FTS_DB_PATH": str(db_path),
+        "VAULT_FTS_LANGUAGES": "en,de",
     })
     log_path = tmp_path / "server.log"
     with open(log_path, "wb") as log:
@@ -123,6 +124,11 @@ def test_search_over_http_follows_tool_writes_and_outside_edits(tmp_path, vault)
         assert "FTS index ready" in log_path.read_text(errors="replace")
         hits = call_tool(base_url, "vault_fts_search", {"query": "traefik"})
         assert paths(hits)[0] == "howto/livesync-traefik.md", hits
+
+        # Languages come from the environment; stemming reaches the client as word forms.
+        assert "[english, german]" in log_path.read_text(errors="replace")
+        stemmed = call_tool(base_url, "vault_fts_search", {"query": "wie viele zertifikat"})
+        assert stemmed["ignored_stopwords"] == ["wie"] and stemmed["word_forms"] == {"zertifikat": ["zertifikate"]}
 
         # A write through the server's own tool is searchable on the very next call.
         call_tool(base_url, "vault_write", {"path": "projekte/loki.md", "content": "Logs mit Loki sammeln.\n"})

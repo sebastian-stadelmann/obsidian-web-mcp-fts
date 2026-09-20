@@ -19,3 +19,8 @@ VAULT_FTS_DB_PATH: str | Path = (
 # Notes larger than this are not indexed. Guards against a multi-megabyte export
 # renamed to .md bloating the index; ordinary notes are far below it.
 VAULT_FTS_MAX_FILE_BYTES = int(os.environ.get("VAULT_FTS_MAX_FILE_BYTES", "2000000"))
+
+# Languages for stemming and stopwords, as ISO codes or Snowball names: "en" (default),
+# "en,de", "english, german, french". "none" switches both off. Changing this needs no
+# reindex; only the small stem table is rebuilt on the next start.
+VAULT_FTS_LANGUAGES = os.environ.get("VAULT_FTS_LANGUAGES", "").strip() or "en"
