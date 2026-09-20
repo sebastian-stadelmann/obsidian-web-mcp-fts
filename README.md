@@ -1,101 +1,259 @@
 # obsidian-web-mcp-fts
 
-Ranked full-text search for
-[jimprosser/obsidian-web-mcp](https://github.com/jimprosser/obsidian-web-mcp), built on
-SQLite FTS5. It is an **extension**, not a fork: the server is a pinned dependency, this
-package adds one tool through the server's `Extension` seam and starts it with
-`serve([FtsExtension()])`. No new services and no dependencies beyond the server's own;
-FTS5 ships with Python's `sqlite3`.
+Ranked full-text search for [obsidian-web-mcp](https://github.com/jimprosser/obsidian-web-mcp),
+the remote MCP server for Obsidian vaults. It adds one tool, `vault_fts_search`, built on
+SQLite FTS5.
 
-## What it adds
+This is an **extension**, not a fork. The server stays an unmodified, pinned dependency;
+this package plugs into its `Extension` seam and starts it with `serve([FtsExtension()])`.
+No new services: FTS5 ships with Python's `sqlite3`, and the only added dependency is the
+pure-Python `snowballstemmer`. An independent project, not affiliated with upstream.
 
-The stock `vault_search` is grep: line-based, unranked, one regex. `vault_fts_search`:
+## Why: grep finds lines, this finds notes
 
-- **Ranks** with BM25. A hit in the title, aliases or description outranks a hit in the body
-  (column weights: title 10, aliases 8, description 5, path 4, tags 3, headings 3, body 1).
-- **Matches whole notes.** `e2ee zertifikate` finds a note that has the two words on
-  different lines.
-- **Folds case and diacritics.** `muller` finds `Müller`, `anderung` finds `Änderung`.
-- **Takes questions as they come.** German and English filler words (`wie`, `warum`, `mit`,
-  `the`, `how` ...) are ignored. If no note has every remaining term, the largest set of
-  terms that some note has is searched instead, preferring the rarest terms.
-- **Survives punctuation.** `file-provider`, `C++`, `10:30` or a URL are searched as text
-  instead of failing in the FTS5 parser.
-- **Speaks FTS5** when the query uses it: `"exact phrase"`, `term*`, `a OR b`, `a NOT b`,
-  `NEAR(a b, 5)`, `title:term`. Such a query runs as written and is never widened.
+The server's built-in `vault_search` is ripgrep: one regex, matched line by line, results
+in file order. That is the right tool for an exact string. It is the wrong tool for the
+question an assistant usually has: *which note is about this?*
 
-Not yet: stemming. `Änderungen` does not find `Änderung`; use `änderung*`.
+Take a vault with a how-to titled "Renew the wildcard certificate", a project note that
+says "Decisions: we decided against Kubernetes", a contact "Jonas Müller", and daily notes
+that mention Traefik in passing.
 
-### Tool
+| Query | `vault_search` (grep) | `vault_fts_search` |
+| --- | --- | --- |
+| `renew certificate` | Nothing. The two words are never on one line in that order. | The how-to, matched in title, aliases, description, headings and body. |
+| `traefik` | Every line containing it, in file order, until the limit is reached. The how-to and a passing mention in a daily note look the same. | The how-to first, because it matches in the description too. Daily notes after it. |
+| `certificates` | Misses every note that says "certificate". | Finds both forms and highlights the one that is there. |
+| `muller` | Nothing. | `Müller`, the contact note first (name in path and title), then the daily note. |
+| `decision kubernetes` | Nothing. | "**Decisions**: we decided against **Kubernetes**." |
+| `how do I renew the certificates` | Nothing. | Ignores `how do I the`, finds the how-to through `renew` and `certificate`. |
 
-`vault_fts_search(query, path_prefix=None, max_results=20)`
+grep stays the better choice for a regular expression, an exact line, or files that are
+not markdown. Both tools are there; this one does not replace the other.
 
-`path_prefix` is a string prefix on the vault-relative path; end it with `/` to mean a
-folder (`daily/`). `max_results` is capped at the server's search limit (50).
+What comes back for the last query:
 
 ```json
 {
   "results": [
     {
-      "path": "howto/livesync-traefik.md",
-      "title": "LiveSync mit Traefik",
-      "score": 8.617,
-      "matched_fields": ["path", "title", "description", "body"],
-      "snippet": "…«Traefik» «File-Provider» nachgerüstet, Zertifikate bleiben erhalten…",
-      "description": "Obsidian LiveSync hinter dem Traefik File-Provider mit CouchDB.",
-      "tags": ["obsidian", "homelab"]
+      "path": "howto/renew-wildcard-certificate.md",
+      "title": "Renew the wildcard certificate",
+      "score": 11.366,
+      "matched_fields": ["path", "title", "aliases", "description", "headings", "body"],
+      "snippet": "# «Renew» the wildcard «certificate» ## Why it expires The «certificate» is valid for 90 days. ## Steps Traefik picks up the «renewed» file from acme.json…",
+      "description": "Renewing the Let's Encrypt wildcard certificate behind Traefik, step by step.",
+      "tags": ["tls", "homelab"],
+      "match": "word_forms"
     }
   ],
   "total": 1,
   "truncated": false,
-  "query_mode": "all"
+  "query_mode": "all",
+  "ignored_stopwords": ["how", "do", "I", "the"],
+  "word_forms": {"renew": ["renewal", "renewed", "renewing"], "certificates": ["certificate"]}
 }
 ```
 
-`query_mode` says how the query was read: `fts5` (ran as written), `all` (every term is
-in every result) or `relaxed` (some terms were left out; `dropped_terms` lists them).
-`ignored_stopwords` lists filler words that were skipped.
+The response says how the query was read, so the caller is never left guessing why
+something matched.
+
+## Quick start
+
+Requirements: Python 3.12 or newer with an SQLite that has FTS5 (the builds from
+python.org, Homebrew, Debian and uv all do), and [uv](https://docs.astral.sh/uv/).
+
+```bash
+git clone https://github.com/sebastian-stadelmann/obsidian-web-mcp-fts
+cd obsidian-web-mcp-fts
+uv sync
+VAULT_PATH=~/Obsidian/MyVault VAULT_MCP_TOKEN=change-me uv run vault-mcp-fts
+```
+
+`vault-mcp-fts` takes the place of the stock `vault-mcp` command. It is the same server
+with the same environment variables (OAuth, tunnel, allowed hosts ...; see the
+[upstream README](https://github.com/jimprosser/obsidian-web-mcp#configuration)) and one
+more tool. The log confirms the index with a line like this (the server's log handler
+may wrap it to the terminal width):
+
+```text
+FTS index ready: 331 notes (331 indexed, 0 unchanged, 0 removed, 0 skipped), 12435 words stemmed for [english] in 0.42s [/home/you/.local/share/vault-mcp/fts.sqlite]
+```
+
+If a client was already connected, reconnect it once so the new tool shows up in its
+tool list.
+
+Already running your own extension? Pass both: `serve([FtsExtension(), MyExtension()])`.
+
+## The tool
+
+`vault_fts_search(query, path_prefix=None, max_results=20)`
+
+- `query`: plain words, a question, or FTS5 syntax (see below).
+- `path_prefix`: a string prefix on the vault-relative path. End it with `/` to mean a
+  folder: `daily/` is the folder, `daily` also matches `daily-archive/`.
+- `max_results`: capped at the server's search limit (50).
+
+Each result carries `path`, `title`, `score`, `matched_fields`, a `snippet` with the
+matches marked `«like this»`, plus `description` and `tags` when the note has them in its
+frontmatter. Results come from the index; no note is opened at query time.
+
+| Response field | Meaning |
+| --- | --- |
+| `query_mode` | `all`: every term is in every result. `relaxed`: no note had every term, so some were left out. `fts5`: the query used FTS5 syntax and ran as written. |
+| `dropped_terms` | The terms left out in `relaxed` mode. |
+| `ignored_stopwords` | Filler words that were skipped. |
+| `word_forms` | Query word → the other forms it was expanded to. |
+| `match: "word_forms"` | On a result that has some query word only in another form. Its score is reduced. |
+| `truncated` | There were more results than `max_results`. |
+
+### How a query is read
+
+- **Ranked with BM25**, and a hit counts for more the more it says about the note: title
+  10, aliases 8, description 5, path 4, tags 3, headings 3, body 1.
+- **Whole notes, not lines.** `e2ee certificate` finds a note that has the two words in
+  different paragraphs.
+- **Case and accents are folded.** `muller` finds `Müller`, `cafe` finds `café`.
+- **Word forms match** through stemming, in the active languages (next section).
+- **Filler words are ignored**: `how`, `the`, `wie`, `warum` ...
+- **No note has every term?** The largest set of terms that some note does have is
+  searched instead. Among equally large sets the one with the rarest terms wins, since it
+  is the most specific reading of the query.
+- **Punctuation is text, not syntax.** `file-provider`, `C++`, `10:30` or a URL are
+  searched as written instead of failing in the FTS5 parser.
+- **FTS5 syntax works** and runs exactly as written, with no stemming and no widening:
+
+  | Syntax | Meaning |
+  | --- | --- |
+  | `"wildcard certificate"` | exact phrase |
+  | `"certificate"` | this exact word, no other forms |
+  | `cert*` | prefix |
+  | `traefik NOT kubernetes`, `podman OR docker` | boolean (operators in capitals) |
+  | `NEAR(müller traefik, 3)` | within three words of each other |
+  | `title:certificate` | one field only: `path`, `title`, `aliases`, `description`, `tags`, `headings`, `body` |
+
+## Languages and stemming
+
+English is the default. Further languages are switched on next to it, not instead of it,
+because a vault is rarely monolingual:
+
+```bash
+VAULT_FTS_LANGUAGES=en,de
+```
+
+**English** (default)
+
+| Query | Also finds | Note |
+| --- | --- | --- |
+| `certificate` | certificates | |
+| `renew` | renewed, renewing, renewal | |
+| `decision` | Decisions | |
+| `how do I renew the certificates` | the how-to on renewing a certificate | `how`, `do`, `I`, `the` are ignored |
+
+**German** (`en,de`)
+
+| Query | Also finds | Note |
+| --- | --- | --- |
+| `zertifikat` | Zertifikate | |
+| `entscheidung` | Entscheidungen | |
+| `regel firewall` | "Regeln für die Firewall" | |
+| `welche entscheidung zur infrastruktur` | "Entscheidungen zur Infrastruktur" | `welche`, `zur` are ignored |
+
+**French** (`en,fr`)
+
+| Query | Also finds | Note |
+| --- | --- | --- |
+| `certificat` | certificats | |
+| `decision` | Décisions | accent folding plus stemming |
+| `securite` | sécurité | accent folding alone |
+
+**Italian** (`en,it`)
+
+| Query | Also finds | Note |
+| --- | --- | --- |
+| `certificato rinnovato` | "i certificati vengono rinnovati" | |
+| `citta` | città | accent folding alone |
+
+A query word is stemmed by every active language, and the forms found by any of them
+count. In a mixed vault that is what you want: with `en,fr`, `certificat` also finds the
+English `certificates`. Occasionally it produces a false friend.
+
+A language brings a [Snowball](https://snowballstem.org/) stemmer and a stopword list.
+Stopword lists exist for English and German. The other Snowball languages (`es`, `nl`,
+`pt`, `sv`, `da`, `fi`, `ru` ... about thirty) are stemmed without one, so their filler
+words count as ordinary words; the relaxation step usually absorbs that. English and
+German are covered by the test suite. French and Italian behave as shown above. The rest
+use the same mechanism and are untested. A stopword list is a few lines in
+[stopwords.py](src/vault_fts/stopwords.py), and contributions are welcome. `none`
+switches stemming and stopwords off.
+
+### How stemming works here
+
+Stemming happens **at query time**, not in the index. Notes are indexed word for word. A
+side table holds the stem of every word in the index vocabulary, and a query word is
+expanded to the vocabulary words sharing its stem: `certificate` becomes
+`"certificate" OR "certificates"`. Because the text itself is never stemmed,
+
+- phrases, FTS5 syntax, snippets, highlights and field weights work unchanged, and the
+  form that matched is what gets highlighted in the original text,
+- a word in double quotes is matched exactly,
+- changing the languages needs no reindex. Only the stem table is rebuilt, which took
+  under a second for 12,000 distinct words and two languages.
+
+BM25 sees each form as a term of its own, so a rare form would outweigh the common one.
+In one real vault the German query `entscheidung` put a note on top that contained only
+`entscheidend` and `Entscheiderin`. A result therefore loses up to half its score, in
+proportion to how many query words it has only in another form. One word of three in
+another form barely matters; a result with none of the words as typed drops below those
+that have them.
+
+What a stemmer cannot do: irregular forms (`ran` / `run`, `läuft` / `laufen`), German
+compounds (`Zertifikatserneuerung` does not find `Zertifikat`; use `zertifikat*`), and it
+sometimes conflates unrelated words (`Zustand` / `zuständig`).
 
 ## How the index stays current
 
-- **At startup** the index is reconciled with the vault before the server accepts requests:
-  new and changed notes (by mtime and size) are indexed, vanished ones removed. With a
-  persisted index file a restart only stats the files. A full build of 330 notes took
-  about 0.2 s on an M-series Mac.
-- **Edits from outside the server** (Obsidian Sync, a LiveSync bridge writing into the
-  vault) arrive through the server's filesystem watcher, a few seconds after the change.
+- **At startup** the index is reconciled with the vault before the server accepts requests.
+  New and changed notes (by mtime and size) are indexed, vanished ones removed. With a
+  persisted index file a restart only stats the files.
+- **Edits from outside the server** (Obsidian Sync, a sync tool writing into the vault
+  folder) arrive through the server's filesystem watcher, a few seconds after the change.
 - **Writes through the server's own tools** are indexed immediately, so a search right
   after `vault_write`, `vault_edit`, `vault_move` or `vault_delete` sees the result.
 
 Only `*.md` files are indexed. `.obsidian`, `.trash`, `.git` and every dot-directory are
-skipped. Every path passes the server's own read guard, so files outside the vault and
-hardlinked files are never indexed and never returned.
+skipped.
 
 ## Configuration
 
-Same environment variables as `vault-mcp` (`VAULT_PATH`, `VAULT_MCP_TOKEN`, OAuth ...), plus:
+All of the server's own variables apply (`VAULT_PATH`, `VAULT_MCP_TOKEN`, OAuth ...), plus:
 
 | Variable | Default | Description |
-|---|---|---|
-| `VAULT_FTS_DB_PATH` | `~/.local/share/vault-mcp/fts.sqlite` | Index file, or `:memory:` to rebuild on every start. |
+| --- | --- | --- |
+| `VAULT_FTS_LANGUAGES` | `en` | Languages for stemming and stopwords: ISO codes or Snowball names, comma-separated (`en,de`). `none` disables both. An unknown language stops the start with a list of valid codes. |
+| `VAULT_FTS_DB_PATH` | `~/.local/share/vault-mcp/fts.sqlite` | Index file, or `:memory:` to rebuild on every start. Must be outside the vault. |
 | `VAULT_FTS_MAX_FILE_BYTES` | `2000000` | Notes larger than this are not indexed. |
 
-The index file holds vault plaintext. It is created with mode `0600`, and the server
-**refuses to start** if the path resolves inside the vault, where a sync tool would
-replicate it to every device. Any other index problem (unwritable path, SQLite without
-FTS5) only disables the tool; the rest of the vault server keeps running.
+## Security
 
-## Run
+- **An extension is trusted code.** It runs inside the server process with full access to
+  the vault and the server's secrets; see the trust model in the
+  [upstream README](https://github.com/jimprosser/obsidian-web-mcp#extending-the-server).
+  Read it before you run it; it is about 1,100 lines.
+- **The index file is vault plaintext.** It is created with mode `0600`, and the server
+  **refuses to start** if the path resolves inside the vault, where a sync tool would
+  replicate it to every device.
+- **Same read guard as the server.** Every path goes through the server's own
+  `resolve_vault_read_path`, when it is indexed and again when it is returned. Files
+  outside the vault, dotfiles and hardlinked files are never indexed and never returned.
+- **Search failure is contained.** Any other index problem (unwritable path, an SQLite
+  without FTS5) only disables this tool. The rest of the vault server keeps running.
+- The tool is read-only and adds no HTTP routes.
 
-```bash
-uv sync
-uv run vault-mcp-fts
-```
+## Container
 
-### Container
-
-Replace the stock server's image with one built from this repository. `uv sync` fetches
-the pinned server from GitHub.
+An example, not yet built and tested by the author. `uv sync` fetches the pinned server
+from GitHub, so the image needs `git`.
 
 ```dockerfile
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
@@ -107,19 +265,17 @@ RUN uv sync --frozen
 CMD ["uv", "run", "vault-mcp-fts"]
 ```
 
-Keep the existing `environment:` block and add the index location on a volume outside
-the vault mount:
+Keep the index on a volume that is not the vault mount:
 
 ```yaml
     environment:
+      VAULT_PATH: /data/vault
       VAULT_FTS_DB_PATH: /data/fts/fts.sqlite
+      VAULT_FTS_LANGUAGES: "en,de"
     volumes:
       - ./vault:/data/vault:Z
       - ./fts:/data/fts:Z
 ```
-
-After the first start the log shows `FTS index ready: N notes ...`. Reconnect the
-connector in claude.ai once so the new tool shows up in its tool list.
 
 ## Development
 
@@ -127,7 +283,8 @@ connector in claude.ai once so the new tool shows up in its tool list.
 src/vault_fts/
     extension.py    FtsExtension: seam hooks, the tool, both change feeds
     index.py        FtsIndex: schema, reconcile, incremental updates, query handling
-    stopwords.py    filler words ignored in plain-word queries
+    languages.py    language packs: Snowball stemmer + stopwords
+    stopwords.py    filler words per language
     config.py       environment variables
     main.py         entry point: serve([FtsExtension()])
 tests/
@@ -147,13 +304,26 @@ To work against a local checkout of the server instead of the pinned commit:
 uv add --editable ../obsidian-web-mcp
 ```
 
-The server dependency is pinned to a commit in `pyproject.toml`. Bump it deliberately and
-run the tests; the seam (`Extension`, `add_change_listener`, `register_write_listener`)
-is young.
+The server dependency is pinned to a commit in `pyproject.toml`, because upstream has no
+releases on PyPI and its extension seam (`Extension`, `add_change_listener`,
+`register_write_listener`) is young. Bump the pin deliberately and run the tests.
 
-Known gaps: no stemming, no audit-log records for `vault_fts_search` (the server's audit
-wrapper is private), `.canvas` and other non-markdown files are not indexed.
+Issues and pull requests are welcome, especially stopword lists and reports on languages
+other than English and German.
+
+## Status and limits
+
+New. Covered by its test suite, including an end-to-end test against a real server
+process, and tried against one real vault of 330 notes, where a full build takes under a
+second and a query a few milliseconds. It has not run in production for long.
+
+- Only markdown is indexed; `.canvas` and attachments are not.
+- `vault_fts_search` does not appear in the server's audit log. The audit wrapper is
+  private to the server.
+- Hub pages that list many notes with their descriptions match many queries. They rank
+  low, but they show up.
+- No semantic search. This finds words and their forms, not paraphrases.
 
 ## License
 
-MIT.
+MIT. See [LICENSE](LICENSE).
