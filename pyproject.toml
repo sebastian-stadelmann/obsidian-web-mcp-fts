@@ -1,0 +1,32 @@
+[project]
+name = "obsidian-web-mcp-fts"
+version = "0.1.0"
+description = "SQLite FTS5 full-text search extension for obsidian-web-mcp (ranked, German-aware, no extra services)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "obsidian-web-mcp @ git+https://github.com/jimprosser/obsidian-web-mcp@a29af7092e95",
+    "snowballstemmer>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+vault-mcp-fts = "vault_fts.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vault_fts"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
