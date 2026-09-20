@@ -107,7 +107,7 @@ def parse_note(rel_path: str, text: str) -> ParsedNote:
     try:
         post = frontmatter.loads(text)
         metadata, body = dict(post.metadata), post.content
-    except Exception:
+    except Exception:  # noqa: BLE001 - YAML parsers raise many unrelated types
         # Broken YAML must not hide the note from search: index it as plain text.
         metadata, body = {}, text
 

@@ -124,7 +124,7 @@ class FtsExtension(Extension):
 
         try:
             self._index.open()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # A broken search index must not take the whole vault server down.
             self._unavailable_reason = f"FTS index unavailable: {exc}"
             logger.error("%s -- %s will return an error", self._unavailable_reason, TOOL_NAME)
@@ -162,7 +162,7 @@ class FtsExtension(Extension):
             return dumps({"error": self._unavailable_reason})
         try:
             return dumps(self._index.search(query, path_prefix, max_results))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a tool answers with an error, it does not raise
             logger.error("%s error: %s", TOOL_NAME, exc)
             return dumps({"error": str(exc)})
 

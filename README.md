@@ -1,5 +1,7 @@
 # obsidian-web-mcp-fts
 
+[![CI](https://github.com/sebastian-stadelmann/obsidian-web-mcp-fts/actions/workflows/ci.yml/badge.svg)](https://github.com/sebastian-stadelmann/obsidian-web-mcp-fts/actions/workflows/ci.yml)
+
 Ranked full-text search for [obsidian-web-mcp](https://github.com/jimprosser/obsidian-web-mcp),
 the remote MCP server for Obsidian vaults. It adds one tool, `vault_fts_search`, built on
 SQLite FTS5.
@@ -292,7 +294,10 @@ tests/
 
 ```bash
 uv run --extra dev pytest
+uv run --extra dev ruff check src tests
 ```
+
+CI runs both on Python 3.12, 3.13 and 3.14 for every pull request and every push to `main`.
 
 `tests/test_live_server.py` starts the real server process and calls the tools over MCP
 streamable HTTP with a bearer token, including an edit made behind the server's back. It
