@@ -22,7 +22,9 @@ from contextlib import asynccontextmanager, contextmanager
 from ._samples import paths
 
 TOKEN = "fts-live-test-token"
-_PASSTHROUGH = ("PATH", "SYSTEMROOT", "TEMP", "TMP", "LD_LIBRARY_PATH", "TZ")
+# COVERAGE_PROCESS_CONFIG is set by coverage.py itself (patch = subprocess) and is what
+# makes the child measure its own lines. It is absent when the tests run without --cov.
+_PASSTHROUGH = ("PATH", "SYSTEMROOT", "TEMP", "TMP", "LD_LIBRARY_PATH", "TZ", "COVERAGE_PROCESS_CONFIG")
 
 
 def _free_port() -> int:

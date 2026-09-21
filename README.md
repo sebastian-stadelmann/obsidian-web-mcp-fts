@@ -1,6 +1,7 @@
 # obsidian-web-mcp-fts
 
 [![CI](https://github.com/sebastian-stadelmann/obsidian-web-mcp-fts/actions/workflows/ci.yml/badge.svg)](https://github.com/sebastian-stadelmann/obsidian-web-mcp-fts/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/sebastian-stadelmann/obsidian-web-mcp-fts/badges/coverage.json)](https://github.com/sebastian-stadelmann/obsidian-web-mcp-fts/actions/workflows/ci.yml)
 
 Ranked full-text search for [obsidian-web-mcp](https://github.com/jimprosser/obsidian-web-mcp),
 the remote MCP server for Obsidian vaults. It adds one tool, `vault_fts_search`, built on
@@ -412,10 +413,15 @@ tests/
 
 ```bash
 uv run --extra dev pytest
+uv run --extra dev pytest --cov    # with line and branch coverage
 uv run --extra dev ruff check src tests
 ```
 
-CI runs both on Python 3.12, 3.13 and 3.14 for every pull request and every push to `main`.
+CI runs the tests with coverage and the linter on Python 3.12, 3.13 and 3.14 for every pull
+request and every push to `main`. A run fails when coverage drops below the `fail_under`
+floor in `pyproject.toml`. The server process started by `tests/test_live_server.py` is
+measured too. The coverage table is in each run's summary, and a green `main` writes the
+number behind the badge to the `badges` branch.
 
 `tests/test_live_server.py` starts the real server process and calls the tools over MCP
 streamable HTTP with a bearer token, including an edit made behind the server's back. It
