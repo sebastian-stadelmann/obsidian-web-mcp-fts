@@ -26,6 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-cov>=6.0",
     # Pinned to a minor: ruff's default rule set grows between minors, and CI must not
     # start failing on code nobody touched.
     "ruff>=0.16,<0.17",
@@ -51,6 +52,21 @@ allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["vault_fts"]
+branch = true
+# tests/test_live_server.py runs the server in a child process that is stopped with
+# SIGTERM. Without these two, everything that only runs there (main.py) counts as 0 %.
+patch = ["subprocess"]
+sigterm = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+# A floor, not a target: measured coverage is 95 %. pytest --cov fails below this.
+fail_under = 90
+exclude_also = ['if __name__ == "__main__":']
 
 [tool.ruff]
 line-length = 120

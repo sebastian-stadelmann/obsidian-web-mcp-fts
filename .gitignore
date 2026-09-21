@@ -5,6 +5,8 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+.coverage
+.coverage.*
 *.sqlite
 *.sqlite-journal
 .env

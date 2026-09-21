@@ -12,6 +12,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # The matrix leg whose coverage is reported and shown in the README badge.
+  COVERAGE_PYTHON: "3.12"
+
 jobs:
   test:
     name: Tests (Python ${{ matrix.python-version }})
@@ -31,4 +35,54 @@ jobs:
       - run: uv sync --frozen --extra dev
       - run: uv run --frozen --extra dev ruff check src tests
       # Includes tests/test_live_server.py: the real server process, called over HTTP.
-      - run: uv run --frozen --extra dev pytest -v
+      # --cov fails the run below fail_under in pyproject.toml, on every Python version.
+      - run: uv run --frozen --extra dev pytest -v --cov
+      - name: Coverage report
+        if: matrix.python-version == env.COVERAGE_PYTHON
+        run: |
+          uv run --frozen --extra dev coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          uv run --frozen --extra dev coverage report --format=total > coverage-total.txt
+      - uses: actions/upload-artifact@v7
+        if: matrix.python-version == env.COVERAGE_PYTHON
+        with:
+          name: coverage-total
+          path: coverage-total.txt
+          retention-days: 1
+
+  coverage-badge:
+    name: Coverage badge
+    # Only a green main moves the badge. A job of its own, so that the write permission
+    # never sits next to the steps that run the code under test.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: coverage-total
+      # The README badge is a shields.io endpoint badge that reads this file. The branch
+      # holds one commit, replaced on every run, so it never grows.
+      - name: Publish coverage.json to the badges branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          total=$(cat coverage-total.txt)
+          case "$total" in
+            ''|*[!0-9]*) echo "unexpected coverage total: '$total'" >&2; exit 1 ;;
+          esac
+          if [ "$total" -ge 90 ]; then color=brightgreen
+          elif [ "$total" -ge 75 ]; then color=yellow
+          else color=red
+          fi
+          git init --quiet --initial-branch=badges badges
+          cd badges
+          printf '{"schemaVersion": 1, "label": "coverage", "message": "%s%%", "color": "%s"}\n' \
+            "$total" "$color" > coverage.json
+          git add coverage.json
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet -m "Coverage of ${GITHUB_SHA}"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
